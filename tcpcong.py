@@ -32,23 +32,18 @@ def load(flows):
 class FlowGraph:
     def __init__(self, flowid):
         self.flowid = flowid
-        self.cwnds = []
-        self.rtts = []
+        self.data = []
 
     def observation(self, cwnd: int, rtt: float):
         now = time.time()
-        self.cwnds.append((now, cwnd))
-        if len(self.cwnds) > 10:
-            while self.cwnds[-1][0] - self.cwnds[0][0] > 10:
-                self.cwnds = self.cwnds[1:]
-        self.rtts.append((now, rtt))
-        if len(self.rtts) > 10:
-            while self.rtts[-1][0] - self.rtts[0][0] > 10:
-                self.rtts = self.rtts[1:]
+        self.data.append((now, cwnd, rtt))
+        if len(self.data) > 10:
+            while self.data[-1][0] - self.data[0][0] > 10:
+                self.data = self.data[1:]
 
     def cwnd_graph(self, fn):
         now = time.time()
-        times, cwnds = zip(*self.cwnds)
+        times, cwnds, _ = zip(*self.data)
         times = [t - now for t in times]
         return fn(xs=times, ys=cwnds, lines=True, title=self.flowid + " cwnd")
 
@@ -62,7 +57,7 @@ class FlowGraph:
 
     def rtt_graph(self, fn):
         now = time.time()
-        times, rtts = zip(*self.rtts)
+        times, _, rtts = zip(*self.data)
         times = [t - now for t in times]
         return fn(xs=times, ys=rtts, lines=True, title=self.flowid + " RTT")
 
@@ -101,6 +96,7 @@ def poll(bpf, flow_hist):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--flow', type=str, required=True, action='append')
+    parser.add_argument('--file', type=str, required=False)
     args = parser.parse_args()
     rules = []
     for f in args.flow:
@@ -115,11 +111,24 @@ if __name__ == '__main__':
 
     flows = {}
     last_print = time.time()
-    while True:
-        time.sleep(0.1)
-        poll(bpf, flows)
-        if time.time() - last_print > 5:
-            for f in flows:
-                flows[f].print_cwnd_graph()
-                flows[f].print_rtt_graph()
-            last_print = time.time()
+    last_write = time.time()
+    if args.file == None:
+        args.file = '/dev/null'
+        last_write = None
+    with open(args.file, 'w') as outf:
+        if last_write != None:
+            outf.write("time,src,dst,cwnd,rtt\n")
+        while True:
+            time.sleep(0.1)
+            poll(bpf, flows)
+            if last_write != None:
+                for f in flows:
+                    src, dst = f.split('->')
+                    for (t, cwnd, rtt) in [d for d in flows[f].data if d[0] > last_write]:
+                        outf.write(f"{t},{src.strip()},{dst.strip()},{cwnd},{rtt}\n")
+                last_write = time.time()
+            if time.time() - last_print > 5:
+                for f in flows:
+                    flows[f].print_cwnd_graph()
+                    flows[f].print_rtt_graph()
+                last_print = time.time()
