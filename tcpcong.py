@@ -1,73 +1,49 @@
 import time
 import socket
 import ipaddress
-import sys
+import socket
 import argparse
+from ctypes import *
 from bcc import BPF
 
-def flow_rule(src_port, dst_port):
-    rule = []
-    if src_port != None:
-        rule.append(f"(f.sport == {src_port})")
-    if dst_port != None:
-        rule.append(f"(f.dport == {dst_port})")
-    return '(' + ' && '.join(rule) + ')'
+#struct flow {
+#    __u16 family;
+#    __u8 saddr[16];
+#    __u8 daddr[16];
+#    __u16 sport;
+#    __u16 dport;
+#};
+class Flow(Structure):
+    _fields_ = [
+        ("family", c_uint16),
+        ("saddr", c_uint8 * 16),
+        ("daddr", c_uint8 * 16),
+        ("sport", c_uint16),
+        ("dport", c_uint16),
+    ]
 
-def load(flows):
-    bpf_template = None
-    with open("./tcpcong.c", 'r') as f:
-        bpf_template = f.read()
-    assert bpf_template != None
+def load(rule):
+    src_port, dst_port = rule
+    ip_mask = ipaddress.ip_address("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff")
+    family = socket.AF_INET
+    if src_port == None:
+        src_port = 0xffff
+    if dst_port == None:
+        dst_port = 0xffff
+    AddrType = c_uint8 * 16
+    flow = Flow(
+        family = family,
+        saddr = AddrType.from_buffer_copy(ip_mask.packed),
+        daddr = AddrType.from_buffer_copy(ip_mask.packed),
+        sport = int(src_port),
+        dport = int(dst_port))
 
-    if len(flows) > 0:
-        rule = ' || '.join(flow_rule(*f) for f in flows)
-        cond = f"if (!({rule})) {{ return 0; }}"
-        bpf = bpf_template.replace('MATCH_FLOW', cond)
-    else:
-        bpf = bpf_template.replace('MATCH_FLOW', '')
-    bpf = BPF(text=bpf)
-    #bpf.attach_tracepoint(tp="tcp:tcp_probe", fn_name="tracepoint__tcp__tcp_probe")
+    bpf = BPF(src_file=b"./tcpcong.c")
+    cfg = bpf["cfg"]
+    cfg[0] = flow
+
+    bpf.attach_tracepoint(tp=b"tcp:tcp_probe", fn_name=b"tracepoint_tcp_probe")
     return bpf
-
-class FlowGraph:
-    def __init__(self, flowid):
-        self.flowid = flowid
-        self.data = []
-
-    def observation(self, cwnd: int, rtt: float):
-        now = time.time()
-        self.data.append((now, cwnd, rtt))
-        if len(self.data) > 10:
-            while self.data[-1][0] - self.data[0][0] > 10:
-                self.data = self.data[1:]
-
-    def cwnd_graph(self, fn):
-        now = time.time()
-        times, cwnds, _ = zip(*self.data)
-        times = [t - now for t in times]
-        return fn(xs=times, ys=cwnds, lines=True, title=self.flowid + " cwnd")
-
-    def print_cwnd_graph(self):
-        from uniplot import plot
-        self.cwnd_graph(plot)
-
-    def get_cwnd_graph(self) -> [str]:
-        from uniplot import plot_to_string
-        return self.cwnd_graph(plot_to_string)
-
-    def rtt_graph(self, fn):
-        now = time.time()
-        times, _, rtts = zip(*self.data)
-        times = [t - now for t in times]
-        return fn(xs=times, ys=rtts, lines=True, title=self.flowid + " RTT")
-
-    def print_rtt_graph(self):
-        from uniplot import plot
-        return self.rtt_graph(plot)
-
-    def get_rtt_graph(self) -> [str]:
-        from uniplot import plot_to_string
-        return self.rtt_graph(plot_to_string)
 
 def get_addr(addr_bytes, family):
     if family == socket.AF_INET:
@@ -77,41 +53,57 @@ def get_addr(addr_bytes, family):
     else:
         raise Exception("unsupported address family")
 
-def poll(bpf, flow_hist):
+class Entry:
+    def __init__(self, src, dst, cwnd, rtt, snd_nxt, snd_una) -> None:
+        self.src = src
+        self.dst = dst
+        self.cwnd = int(cwnd)
+        self.rtt = int(rtt)
+        self.snd_nxt = int(snd_nxt)
+        self.snd_una = int(snd_una)
+
+    def __str__(self):
+        return f"[{self.src} -> {self.dst}] cwnd {self.cwnd} srtt {self.rtt} snd_nxt {self.snd_nxt} snd_una {self.snd_una}"
+
+    def __repr__(self):
+        return f"<[{self.src} -> {self.dst}] cwnd {self.cwnd} srtt {self.rtt} snd_nxt {self.snd_nxt} snd_una {self.snd_una}>"
+
+    def flowid(self):
+        return f"{self.src} -> {self.dst}"
+
+def poll(bpf, entries):
     from json import JSONDecodeError
     try:
         flows = bpf["flows"]
         for k, v in flows.items():
             saddr = get_addr(bytes(k.saddr), k.family)
             daddr = get_addr(bytes(k.daddr), k.family)
-            #print(f"[{saddr}:{k.sport} -> {daddr}:{k.dport}] cwnd {v.snd_cwnd} srtt {v.srtt}")
-            flowid = f"{saddr}:{k.sport} -> {daddr}:{k.dport}"
-            if flowid not in flow_hist:
-                flow_hist[flowid] = FlowGraph(flowid)
-            flow_hist[flowid].observation(v.snd_cwnd, v.srtt)
+            src = f"{saddr}:{k.sport}"
+            dst = f"{daddr}:{k.dport}"
+            e = Entry(src, dst, v.snd_cwnd, v.srtt, v.snd_nxt, v.snd_una)
+            if e.flowid() not in entries or entries[e.flowid()].snd_nxt != e.snd_nxt:
+                print(e)
+                entries[e.flowid()] = e
+            return entries
     except JSONDecodeError as e:
         print(e)
         print('failed', e.doc)
+    finally:
+        return {}
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--flow', type=str, required=True, action='append')
+    parser.add_argument('--flow', type=str, required=True, action='store')
     parser.add_argument('--file', type=str, required=False)
     args = parser.parse_args()
-    rules = []
-    for f in args.flow:
-        src, dst = f.split('->')
-        src = src.strip()
-        dst = dst.strip()
-        if src == '*' and dst == '*':
-            rules = []
-            break
-        rules.append((int(src) if src != '*' else None, int(dst) if dst != '*' else None))
-    bpf = load(rules)
+    src, dst = args.flow.split('->')
+    src = src.strip()
+    dst = dst.strip()
+    rule = (int(src) if src != '*' else None, int(dst) if dst != '*' else None)
+    bpf = load(rule)
 
-    flows = {}
-    last_print = time.time()
     last_write = time.time()
+    flows = {}
     if args.file == None:
         args.file = '/dev/null'
         last_write = None
@@ -123,12 +115,6 @@ if __name__ == '__main__':
             poll(bpf, flows)
             if last_write != None:
                 for f in flows:
-                    src, dst = f.split('->')
-                    for (t, cwnd, rtt) in [d for d in flows[f].data if d[0] > last_write]:
-                        outf.write(f"{t},{src.strip()},{dst.strip()},{cwnd},{rtt}\n")
+                    for e in flows[f]:
+                        outf.write(f"{e.src.strip()},{e.dst.strip()},{e.cwnd},{e.rtt},{e.snd_nxt},{e.snd_una}\n")
                 last_write = time.time()
-            if time.time() - last_print > 5:
-                for f in flows:
-                    flows[f].print_cwnd_graph()
-                    flows[f].print_rtt_graph()
-                last_print = time.time()
