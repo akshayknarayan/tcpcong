@@ -58,7 +58,7 @@ class Entry:
         self.src = src
         self.dst = dst
         self.cwnd = int(cwnd)
-        self.rtt = int(rtt)
+        self.rtt = int(rtt) >> 3 # srtt is << 3 in the kernel
         self.snd_nxt = int(snd_nxt)
         self.snd_una = int(snd_una)
 

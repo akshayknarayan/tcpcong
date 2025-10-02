@@ -132,7 +132,7 @@ int tracepoint_tcp_probe(struct tcp_probe_args *args) {
         entry = flows.lookup_or_try_init(&f, &zero);
         if (((void*) entry) != NULL) {
             entry->snd_cwnd = args->snd_cwnd;
-            entry->srtt = args->srtt;
+            entry->srtt = args->srtt; // srtt is << 3 in the kernel
             entry->snd_nxt = args->snd_nxt;
             entry->snd_una = args->snd_una;
         }
