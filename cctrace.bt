@@ -1,0 +1,38 @@
+BEGIN {
+    printf("flowid, cwnd, bytes_acked, packets_lost\n");
+}
+
+kretfunc:tcp_ack
+/(args.sk)->__sk_common.skc_dport == (($1 >> 8) | (($1 << 8) & 0xffff)) / // port is a be16, need a u16
+{
+    $saddr = ntop(((struct inet_sock *) (args.sk))->inet_saddr);
+    $sport_be = ((struct inet_sock *) (args.sk))->inet_sport;
+    $sport = (($sport_be >> 8) | (($sport_be << 8) & 0xffff));
+    $daddr = ntop((args.sk)->__sk_common.skc_daddr);
+    $dport_be = (args.sk)->__sk_common.skc_dport;
+    $dport = (($dport_be >> 8) | (($dport_be << 8) & 0xffff));
+    $tp = (struct tcp_sock *) args.sk;
+    //printf("[%s:%u -> %s:%u], cwnd %u, bytes_acked %u, packets_lost %u\n", $saddr, $sport, $daddr, $dport, $tp->snd_cwnd, $tp->bytes_acked, $tp->lost);
+    @flow = ($saddr, $sport, $daddr, $dport);
+    @acked = $tp->bytes_acked;
+    @lost = $tp->lost;
+    @cwnd = avg($tp->snd_cwnd);
+    @rtt = avg($tp->srtt_us >> 3);
+}
+
+// dump out
+interval:ms:100
+/ @flow.3 != 0 /
+{
+    $saddr = @flow.0;
+    $sport = @flow.1;
+    $daddr = @flow.2;
+    $dport = @flow.3;
+    if (@acked != @last_acked) {
+        printf("[%s:%u -> %s:%u], %u, %u, %u, %u\n", $saddr, $sport, $daddr, $dport, (uint32) @cwnd, (uint32) @rtt, @acked, @lost);
+    } else {
+        exit();
+    }
+
+    @last_acked = @acked; 
+}
